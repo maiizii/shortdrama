@@ -1,10 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
@@ -15,6 +18,10 @@ import (
 )
 
 const hongguoBaseURL = "https://hongguoduanju.com"
+
+// hongguoWebUserAgent 是网页端播放页使用的桌面浏览器标识。公开播放接口会按 UA
+// 区分访问者，用移动端 UA 更容易被判定为不可播。
+const hongguoWebUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 func (d *Downloader) fetchHongguoDramas(ctx context.Context) ([]Drama, error) {
 	initialized := hongguoCatalogInitialized(d.hongguoCatalogSnapshot())
@@ -217,11 +224,18 @@ func (d *Downloader) resolveHongguoMedia(ctx context.Context, task Task) (provid
 	if err := ctx.Err(); err != nil {
 		return providerMedia{}, err
 	}
+	media, pagePublicErr := d.resolveHongguoWebPublicMedia(ctx, seriesID, videoID)
+	if pagePublicErr == nil {
+		return media, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return providerMedia{}, err
+	}
 	media, apiErr := d.resolveHongguoPlaybackAPI(ctx, seriesID, videoID)
 	if apiErr == nil {
 		return media, nil
 	}
-	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；备用取流失败：%w", publicError(nativeErr), publicError(pageErr), apiErr)
+	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；公开播放接口失败：%v；备用取流失败：%w", publicError(nativeErr), publicError(pageErr), publicError(pagePublicErr), apiErr)
 }
 
 func (d *Downloader) resolveHongguoWebMedia(ctx context.Context, seriesID, videoID string) (providerMedia, error) {
@@ -241,6 +255,153 @@ func (d *Downloader) resolveHongguoWebMedia(ctx context.Context, seriesID, video
 	}
 	duration, _ := strconv.ParseFloat(mapString(info, "duration"), 64)
 	return providerMedia{URL: mediaURL, Referer: d.providerBaseURL(sourceHongguo) + "/", Duration: time.Duration(duration * float64(time.Second))}, nil
+}
+
+// resolveHongguoWebPublicMedia 走网页端的公开播放接口。2026-10 起播放页不再下发
+// video_player_info，改为受保护播放（DASH + CENC），但网页仍保留一条明文 MP4 直链：
+// POST /api/video/protected/fallback-play-info。该接口要求带 ttwid Cookie，否则对
+// 大部分分集返回 401/403，所以先访问站点首页取 Cookie，再请求接口。上游对同一来源
+// 的短时间重复请求会临时判 403，此时换一个新 Cookie 并稍等重试即可恢复。
+func (d *Downloader) resolveHongguoWebPublicMedia(ctx context.Context, seriesID, videoID string) (providerMedia, error) {
+	payload, err := json.Marshal(map[string]string{"item_id": videoID})
+	if err != nil {
+		return providerMedia{}, err
+	}
+	endpoint := hongguoBaseURL + "/api/video/protected/fallback-play-info?aid=8662"
+	referer := hongguoBaseURL + "/player/" + url.PathEscape(seriesID) + "/" + url.PathEscape(videoID)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * 1200 * time.Millisecond):
+			case <-ctx.Done():
+				return providerMedia{}, ctx.Err()
+			}
+			d.invalidateHongguoWebCookie()
+		}
+		cookie, err := d.hongguoWebCookie(ctx)
+		if err != nil {
+			return providerMedia{}, err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return providerMedia{}, err
+		}
+		// 该接口用 401/403 表示「这一集对外不可播」，不是反爬封锁；标记后限流器
+		// 不会因此暂停整个站点，其他分集仍可继续取流。
+		request = request.WithContext(context.WithValue(request.Context(), providerRejectionKey{}, true))
+		request.Header.Set("User-Agent", hongguoWebUserAgent)
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", hongguoBaseURL)
+		request.Header.Set("Referer", referer)
+		if cookie != "" {
+			request.Header.Set("Cookie", cookie)
+		}
+		media, retry, err := d.hongguoPublicMediaResponse(request)
+		if err == nil {
+			return media, nil
+		}
+		lastErr = err
+		if !retry || ctx.Err() != nil {
+			return providerMedia{}, err
+		}
+	}
+	return providerMedia{}, lastErr
+}
+
+// hongguoPublicMediaResponse 解析一次公开播放请求。retry 表示上游只是临时拒绝
+// （401/403/429），换 Cookie 或稍后重试有机会恢复。
+func (d *Downloader) hongguoPublicMediaResponse(request *http.Request) (providerMedia, bool, error) {
+	response, err := d.doCatalogRequestWithTimeout(request, providerTimeout)
+	if err != nil {
+		return providerMedia{}, false, err
+	}
+	defer response.Body.Close()
+	content, err := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
+	if err != nil {
+		return providerMedia{}, false, err
+	}
+	if len(content) > providerMaxBodyBytes {
+		return providerMedia{}, false, fmt.Errorf("红果公开播放接口返回内容过大")
+	}
+	if response.StatusCode != http.StatusOK {
+		retry := response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests
+		return providerMedia{}, retry, fmt.Errorf("红果公开播放接口 HTTP %d：%s", response.StatusCode, hongguoPublicError(content))
+	}
+	var result struct {
+		MainURL   string `json:"main_url"`
+		URLExpire int64  `json:"url_expire"`
+		BaseResp  struct {
+			StatusCode int `json:"StatusCode"`
+		} `json:"base_resp"`
+	}
+	if err := json.Unmarshal(content, &result); err != nil {
+		return providerMedia{}, false, fmt.Errorf("红果公开播放接口返回格式异常")
+	}
+	if result.BaseResp.StatusCode != 0 {
+		return providerMedia{}, false, fmt.Errorf("红果公开播放接口暂不可用（%d）", result.BaseResp.StatusCode)
+	}
+	mediaURL := strings.TrimSpace(result.MainURL)
+	if !isProviderHTTPMediaURL(mediaURL) {
+		return providerMedia{}, false, fmt.Errorf("红果公开播放接口没有返回可播放地址，该集可能仍受限")
+	}
+	return providerMedia{URL: mediaURL, Referer: d.providerBaseURL(sourceHongguo) + "/"}, false, nil
+}
+
+func (d *Downloader) invalidateHongguoWebCookie() {
+	d.hongguoCookieMu.Lock()
+	d.hongguoCookie, d.hongguoCookieExpires = "", time.Time{}
+	d.hongguoCookieMu.Unlock()
+}
+
+func hongguoPublicError(content []byte) string {
+	message := strings.TrimSpace(string(content))
+	if len(message) > 160 {
+		message = message[:160]
+	}
+	if message == "" {
+		return "空响应"
+	}
+	return message
+}
+
+// hongguoWebCookie 取站点首页下发的 Cookie（主要为 ttwid）。该值只需在进程内短期复用，
+// 过期后由下一次取流自动重新获取。
+func (d *Downloader) hongguoWebCookie(ctx context.Context) (string, error) {
+	d.hongguoCookieMu.Lock()
+	cached := d.hongguoCookie
+	expires := d.hongguoCookieExpires
+	d.hongguoCookieMu.Unlock()
+	if cached != "" && time.Now().Before(expires) {
+		return cached, nil
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, hongguoBaseURL+"/", nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("User-Agent", hongguoWebUserAgent)
+	response, err := d.doCatalogRequestWithTimeout(request, providerTimeout)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
+	var values []string
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == "" || len(cookie.Value) > 512 {
+			continue
+		}
+		values = append(values, cookie.Name+"="+cookie.Value)
+	}
+	joined := strings.Join(values, "; ")
+	if joined == "" {
+		return "", nil
+	}
+	d.hongguoCookieMu.Lock()
+	d.hongguoCookie, d.hongguoCookieExpires = joined, time.Now().Add(30*time.Minute)
+	d.hongguoCookieMu.Unlock()
+	return joined, nil
 }
 
 func hongguoCoverAddress(values ...string) string {

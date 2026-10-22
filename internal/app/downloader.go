@@ -33,6 +33,9 @@ type Downloader struct {
 	ffmpegInstaller       *ffmpegInstaller
 	hongguoOnce           sync.Once
 	hongguo               *hongguoAppClient
+	hongguoCookieMu       sync.Mutex
+	hongguoCookie         string
+	hongguoCookieExpires  time.Time
 	legacyOnce            sync.Once
 	legacy                *legacyAPIClient
 	rankings              rankingCache

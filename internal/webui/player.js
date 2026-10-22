@@ -151,6 +151,30 @@
     mobile.update();
   }
 
+  async function playbackResponseError(response) {
+    const status = response.status;
+    let message = '';
+    try {
+      const text = await response.text();
+      try {
+        const result = JSON.parse(text);
+        window.JukuViewer?.checkResponse(result);
+        message = result.error || '';
+      } catch (_) {
+        message = '';
+      }
+    } catch (_) {}
+    if (!message) {
+      if (status === 502 || status === 503 || status === 504) message = '播放服务暂时不可用，请稍后重试';
+      else if (status === 410) message = '播放会话已过期，请重新打开本剧';
+      else if (status === 429) message = '当前播放任务较多，请稍后再试';
+      else message = '播放请求失败（HTTP ' + status + '）';
+    }
+    const error = new Error(message);
+    error.status = status;
+    return error;
+  }
+
   async function requestJSON(path, body, signal) {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -166,13 +190,9 @@
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal
       });
+      if (!response.ok) throw await playbackResponseError(response);
       const result = await response.json();
       window.JukuViewer?.checkResponse(result);
-      if (!response.ok) {
-        const error = new Error(result.error || 'HTTP ' + response.status);
-        error.status = response.status;
-        throw error;
-      }
       return result;
     } catch (error) {
       if (timedOut) throw new Error('播放请求超时，请检查连接后重试');
@@ -715,11 +735,7 @@
       await waitForEvent(source, 'sourceopen', signal, () => {video.src = objectURL;});
       const response = await fetch('/api/ui/playback/stream?' + new URLSearchParams({session: currentSession, episode: String(index), start: String(offset), quality: String(quality), version: String(version), remux: allowRemux ? '1' : '0'}), {signal, cache: 'no-store', credentials: 'same-origin', headers: window.JukuViewer?.headers()});
       if (!response.ok) {
-        const result = await response.json();
-        window.JukuViewer?.checkResponse(result);
-        const error = new Error(result.error || 'HTTP ' + response.status);
-        error.status = response.status;
-        throw error;
+        throw await playbackResponseError(response);
       }
       if (signal.aborted) throw abortError();
       let options = [];

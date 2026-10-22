@@ -90,6 +90,10 @@ type requestLimiter struct {
 
 type backgroundCatalogKey struct{}
 
+// providerRejectionKey 标记「上游按业务规则拒绝本次资源，而不是反爬封锁」的请求。
+// 这类 401/403 不应该让限流器暂停整个域名，否则后续正常分集也会被一起挡住。
+type providerRejectionKey struct{}
+
 func newRequestLimiter(concurrency int, interval time.Duration) *requestLimiter {
 	if concurrency < 1 {
 		concurrency = 1
@@ -197,6 +201,9 @@ func (limiter *requestLimiter) acquire(ctx context.Context, request *http.Reques
 }
 
 func (limiter *requestLimiter) observe(request *http.Request, response *http.Response) {
+	if _, ok := request.Context().Value(providerRejectionKey{}).(bool); ok {
+		return
+	}
 	if response.StatusCode != http.StatusForbidden && response.StatusCode != http.StatusTooManyRequests && !strings.EqualFold(response.Header.Get("Cf-Mitigated"), "challenge") {
 		return
 	}
